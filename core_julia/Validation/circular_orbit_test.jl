@@ -34,10 +34,6 @@ mkpath(out_dir)
 # ------------------------------------------------------------
 # Parameters (v0.2 controlled, v0.1 default-safe)
 # ------------------------------------------------------------
-ENABLE_NOISE = get(ENV, "ENABLE_NOISE", "0") == "1"
-
-σ_r = parse(Float64, get(ENV, "SIGMA_POS", "0.0"))   # meters
-σ_v = parse(Float64, get(ENV, "SIGMA_VEL", "0.0"))   # m/s
 
 Random.seed!(42)
 

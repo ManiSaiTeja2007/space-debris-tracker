@@ -1,4 +1,4 @@
-import numpy as np
+import numpy as np 
 import pandas as pd
 
 def load_trajectory(csv_path):
@@ -9,3 +9,4 @@ def load_trajectory(csv_path):
     v = df[["vx", "vy", "vz"]].values
 
     return t, r, v
+

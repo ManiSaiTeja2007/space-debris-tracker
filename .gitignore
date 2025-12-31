@@ -265,3 +265,17 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+
+#############################################################################
+
+# Ignore all .csv files
+*.csv
+
+# Ignore all .parquet files
+*.parq
+*.parquet
+*.parquet.gz
+# Ignore all .h5 files
+*.h5
+*.hdf5

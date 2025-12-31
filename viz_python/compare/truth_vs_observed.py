@@ -3,8 +3,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from data_io.load_trajectory import load_trajectory
+from common_io.load_trajectory import load_trajectory
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data" / "generated"
