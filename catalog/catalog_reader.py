@@ -1,5 +1,6 @@
-from pathlib import Path 
+from pathlib import Path
 from typing import List, Tuple
+
 
 def read_tles(tle_path: Path) -> List[Tuple[str, str, str]]:
     """
@@ -9,6 +10,5 @@ def read_tles(tle_path: Path) -> List[Tuple[str, str, str]]:
     out = []
     for i in range(0, len(lines), 3):
         if i + 2 < len(lines):
-            out.append((lines[i], lines[i+1], lines[i+2]))
+            out.append((lines[i], lines[i + 1], lines[i + 2]))
     return out
-
