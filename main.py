@@ -1,7 +1,8 @@
-import subprocess 
+import subprocess
 import sys
 from pathlib import Path
 import shutil
+import argparse
 
 # ============================================================
 # Resolve repository root
@@ -9,91 +10,162 @@ import shutil
 ROOT = Path(__file__).resolve().parent
 
 # ============================================================
-# Locate Julia executable robustly
+# Build and locate Rust binary robustly
 # ============================================================
-JULIA_EXE = shutil.which("julia")
-if JULIA_EXE is None:
-    print("❌ Julia executable not found in PATH")
-    sys.exit(1)
+def build_rust_binary():
+    print("\n" + "=" * 60)
+    print(">> RUNNING: Cargo Build Physics Engine")
+    print("=" * 60)
+    cargo_exe = shutil.which("cargo")
+    if cargo_exe is None:
+        print("[ERROR] cargo executable not found. Make sure Rust is installed.")
+        sys.exit(1)
+        
+    result = subprocess.run([cargo_exe, "build", "--release"], cwd=ROOT / "src" / "physics", check=False)
+    if result.returncode != 0:
+        print("[ERROR] Cargo build failed.")
+        sys.exit(result.returncode)
 
-print(f"Using Julia at: {JULIA_EXE}")
+def get_rust_binary():
+    bin_path_win = ROOT / "src" / "physics" / "target" / "release" / "physics_core.exe"
+    bin_path_unix = ROOT / "src" / "physics" / "target" / "release" / "physics_core"
+    
+    if bin_path_win.exists():
+        return str(bin_path_win)
+    elif bin_path_unix.exists():
+        return str(bin_path_unix)
+    else:
+        # Build first if not found
+        build_rust_binary()
+        if bin_path_win.exists():
+            return str(bin_path_win)
+        elif bin_path_unix.exists():
+            return str(bin_path_unix)
+        else:
+            print("[ERROR] Rust binary not found even after building.")
+            sys.exit(1)
 
+RSCRIPT_EXE = shutil.which("Rscript")
+if RSCRIPT_EXE:
+    print(f"Using Rscript at: {RSCRIPT_EXE}")
+else:
+    print("[WARNING] Rscript not found in PATH. R statistical analysis will be skipped.")
 
 # ============================================================
 # Generic step runner (NO shell, deterministic)
 # ============================================================
 def run_step(name: str, command: list[str], cwd: Path | None = None):
     print(f"\n{'=' * 60}")
-    print(f"▶ RUNNING: {name}")
+    print(f">> RUNNING: {name}")
     print(f"{'=' * 60}")
 
     result = subprocess.run(command, cwd=cwd, check=False)
 
     if result.returncode != 0:
-        print(f"\n❌ FAILED: {name}")
+        print(f"\n[ERROR] FAILED: {name}")
         sys.exit(result.returncode)
 
-    print(f"✅ COMPLETED: {name}")
+    print(f"[SUCCESS] COMPLETED: {name}")
 
 
 # ============================================================
 # Main orchestration pipeline
 # ============================================================
 def main():
+    parser = argparse.ArgumentParser(description="Space Debris Tracker Pipeline")
+    parser.add_argument("--dashboard", action="store_true", help="Launch the Standalone Web Dashboard")
+    parser.add_argument("--noise", type=int, default=1, choices=[0, 1], help="Enable/disable observation noise (1 or 0)")
+    parser.add_argument("--sigma-r", type=float, default=50.0, help="Observation position noise standard deviation (meters)")
+    parser.add_argument("--sigma-v", type=float, default=0.05, help="Observation velocity noise standard deviation (m/s)")
+    parser.add_argument("--state", type=float, nargs=6, metavar=('PX', 'PY', 'PZ', 'VX', 'VY', 'VZ'),
+                        help="Custom initial orbital state vector (6 elements: px py pz vx vy vz)")
+    parser.add_argument("--filter", type=str, default="ekf", choices=["ekf", "ukf"], help="Estimation filter type (ekf or ukf)")
+    parser.add_argument("--maneuver-time", type=float, default=0.0, help="Time to apply active maneuver (seconds since epoch)")
+    parser.add_argument("--maneuver-dv", type=float, nargs=3, default=[0.0, 0.0, 0.0], metavar=('DVR', 'DVT', 'DVN'),
+                        help="Impulsive maneuver delta V vector in RTN coordinates (m/s)")
+    
+    args, unknown = parser.parse_known_args()
+
+    if args.dashboard:
+        dashboard_path = ROOT / "src" / "viz" / "dashboard.py"
+        print("\n" + "=" * 60)
+        print(f">> LAUNCHING STREAMLIT DASHBOARD: {dashboard_path}")
+        print("=" * 60)
+        
+        streamlit_cmd = [sys.executable, "-m", "streamlit", "run", str(dashboard_path)]
+        subprocess.run(streamlit_cmd)
+        return
+
 
     # --------------------------------------------------------
-    # STEP 1: Julia physics (truth + optional noise)
+    # STEP 1: Rust physics simulation & Least Squares estimation
     # --------------------------------------------------------
-    # Arguments:
-    #   ARGS[1] = repo_root
-    #   ARGS[2] = enable_noise (1 / 0)
-    #   ARGS[3] = sigma_position (m)
-    #   ARGS[4] = sigma_velocity (m/s)
-    #
-    run_step(
-        name="Julia Core Physics (v0.1 / v0.2)",
-        command=[
-            JULIA_EXE,
-            "Validation/circular_orbit_test.jl",
-            str(ROOT),  # repo root (authoritative)
-            "1",  # ENABLE_NOISE (set "0" for v0.1)
-            "50.0",  # SIGMA_POS (meters)
-            "0.05",  # SIGMA_VEL (m/s)
-        ],
-        cwd=ROOT / "core_julia",
-    )
+    rust_bin = get_rust_binary()
+    rust_cmd = [
+        rust_bin,
+        str(ROOT),
+        str(args.noise),
+        str(args.sigma_r),
+        str(args.sigma_v),
+    ]
+    if args.state:
+        rust_cmd.extend([str(x) for x in args.state])
+    else:
+        # Default ISS-like orbit state to pad coordinates before filter/maneuver arguments
+        default_state = [6778137.0, 0.0, 0.0, 0.0, 7668.558175407055, 0.0]
+        rust_cmd.extend([str(x) for x in default_state])
 
-    # --------------------------------------------------------
-    # STEP 2: CelesTrak reference propagation (SGP4)
-    # --------------------------------------------------------
-    # Produces:
-    #   data/generated/reference_sgp4.csv
-    #
+    rust_cmd.append(args.filter)
+    rust_cmd.append(str(args.maneuver_time))
+    rust_cmd.append(str(args.maneuver_dv[0]))
+    rust_cmd.append(str(args.maneuver_dv[1]))
+    rust_cmd.append(str(args.maneuver_dv[2]))
+
     run_step(
-        name="CelesTrak SGP4 Reference (ISS)",
-        command=[sys.executable, "-m", "catalog.run_celestrak_reference"],
+        name="Rust Physics Core & Orbit Determination",
+        command=rust_cmd,
         cwd=ROOT,
     )
 
     # --------------------------------------------------------
-    # STEP 3: Visualization (Julia truth + optional comparisons)
+    # STEP 2: CelesTrak propagation (SGP4 reference)
     # --------------------------------------------------------
-    # This step:
-    #   - Always visualizes Julia truth
-    #   - Optionally compares truth vs observed
-    #   - Optionally compares truth vs SGP4 reference
-    #
     run_step(
-        name="Python Visualization",
-        command=[sys.executable, "-m", "viz_python.main"],
+        name="CelesTrak Reference Propagation (SGP4)",
+        command=[sys.executable, "-m", "src.catalog.run_celestrak_reference"],
         cwd=ROOT,
     )
 
     # --------------------------------------------------------
-    print("\n🎉 PIPELINE COMPLETED SUCCESSFULLY 🎉")
+    # STEP 3: Coordinate Conversion Pipeline
+    # --------------------------------------------------------
+    run_step(
+        name="Coordinate Conversion (ECI -> LLA)",
+        command=[sys.executable, "-m", "src.coords.run_coordinate_pipeline"],
+        cwd=ROOT,
+    )
+
+    # --------------------------------------------------------
+    # STEP 5: R Statistical Analysis (Optional)
+    # --------------------------------------------------------
+    if RSCRIPT_EXE:
+        run_step(
+            name="R Residual & Error Analysis",
+            command=[RSCRIPT_EXE, "main.R"],
+            cwd=ROOT / "src" / "analysis",
+        )
+
+    # --------------------------------------------------------
+    # STEP 6: Visualization (Plots & Maps)
+    # --------------------------------------------------------
+    run_step(
+        name="Python Visualization Engine",
+        command=[sys.executable, "-m", "src.viz.main"],
+        cwd=ROOT,
+    )
+
+    print("\n*** PIPELINE COMPLETED SUCCESSFULLY ***")
 
 
-# ============================================================
 if __name__ == "__main__":
     main()
-
