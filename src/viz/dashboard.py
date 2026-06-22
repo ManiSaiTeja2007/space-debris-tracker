@@ -5,8 +5,9 @@ import plotly.graph_objects as go
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from sgp4.api import Satrec, jday
 
 # ============================================================
@@ -30,97 +31,100 @@ st.set_page_config(
 
 # Custom premium CSS
 st.markdown("""
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&display=swap" rel="stylesheet">
 <style>
-    /* Dark mode background overrides */
     .stApp {
-        background-color: #030712;
+        background: radial-gradient(ellipse at 60% 0%, #0a1628 0%, #030712 60%);
         color: #f3f4f6;
         font-family: 'Outfit', 'Inter', -apple-system, sans-serif;
     }
-    
-    /* Title and headers */
     h1, h2, h3 {
         color: #ffffff !important;
         font-weight: 700;
         letter-spacing: -0.025em;
     }
-    
-    /* Metric Cards */
     .metric-card {
-        background-color: #0b1128;
-        border-radius: 12px;
-        padding: 20px;
-        box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3), 0 4px 6px -4px rgba(0, 0, 0, 0.3);
-        border: 1px solid #1e293b;
+        background: linear-gradient(135deg, #0b1128 0%, #0f1a35 100%);
+        border-radius: 14px;
+        padding: 18px 22px;
+        box-shadow: 0 10px 25px -5px rgba(0,0,0,0.4);
+        border: 1px solid #1e2d4a;
         text-align: center;
-        transition: all 0.3s ease;
+        transition: all 0.25s ease;
     }
     .metric-card:hover {
         border-color: #00f0ff;
-        box-shadow: 0 10px 20px -3px rgba(0, 240, 255, 0.15);
-        transform: translateY(-2px);
+        box-shadow: 0 0 20px rgba(0,240,255,0.18), 0 10px 25px -5px rgba(0,0,0,0.5);
+        transform: translateY(-3px);
     }
     .metric-label {
-        font-size: 13px;
+        font-size: 11px;
         color: #94a3b8;
         text-transform: uppercase;
-        letter-spacing: 0.05em;
-        margin-bottom: 8px;
+        letter-spacing: 0.1em;
+        margin-bottom: 6px;
     }
     .metric-value {
-        font-size: 24px;
+        font-size: 22px;
         font-weight: 800;
-        color: #00f0ff;
+        background: linear-gradient(90deg, #00f0ff, #7c3aed);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
     }
     .metric-subvalue {
-        font-size: 12px;
-        color: #64748b;
+        font-size: 11px;
+        color: #475569;
         margin-top: 4px;
     }
-    
-    /* Conjunction Risk badges */
     .badge-high {
-        background-color: rgba(239, 68, 68, 0.2);
+        background-color: rgba(239,68,68,0.15);
         color: #ef4444;
-        padding: 4px 8px;
+        padding: 3px 8px;
         border-radius: 6px;
         border: 1px solid #ef4444;
-        font-weight: bold;
-        font-size: 11px;
+        font-weight: 700;
+        font-size: 10px;
+        letter-spacing: 0.05em;
     }
     .badge-warn {
-        background-color: rgba(245, 158, 11, 0.2);
+        background-color: rgba(245,158,11,0.15);
         color: #f59e0b;
-        padding: 4px 8px;
+        padding: 3px 8px;
         border-radius: 6px;
         border: 1px solid #f59e0b;
-        font-weight: bold;
-        font-size: 11px;
+        font-weight: 700;
+        font-size: 10px;
+        letter-spacing: 0.05em;
     }
     .badge-low {
-        background-color: rgba(16, 185, 129, 0.2);
+        background-color: rgba(16,185,129,0.15);
         color: #10b981;
-        padding: 4px 8px;
+        padding: 3px 8px;
         border-radius: 6px;
         border: 1px solid #10b981;
-        font-weight: bold;
-        font-size: 11px;
+        font-weight: 700;
+        font-size: 10px;
+        letter-spacing: 0.05em;
     }
-    
-    /* Log console styling */
     .log-console {
         background-color: #010409;
-        border: 1px solid #30363d;
+        border: 1px solid #1e293b;
         border-radius: 8px;
-        padding: 15px;
+        padding: 12px;
         font-family: 'Courier New', Courier, monospace;
-        color: #8b949e;
-        max-height: 250px;
+        color: #64748b;
+        max-height: 220px;
         overflow-y: auto;
-        font-size: 12px;
+        font-size: 11px;
+    }
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #060d1a 0%, #030712 100%);
+        border-right: 1px solid #1e293b;
     }
 </style>
 """, unsafe_allow_html=True)
+
 
 # ============================================================
 # Helper Functions
@@ -136,8 +140,42 @@ def load_tles_from_db():
     except Exception as e:
         return [], str(e)
 
+@st.cache_resource
+def get_satrec_objects():
+    tles, err = load_tles_from_db()
+    if err or not tles:
+        return [], []
+    sat_objects = []
+    sat_names = []
+    for name, l1, l2 in tles:
+        try:
+            sat = Satrec.twoline2rv(l1, l2)
+            sat_objects.append(sat)
+            sat_names.append(name)
+        except Exception:
+            pass
+    return sat_objects, sat_names
+
+def propagate_constellation(sat_objects, epoch_utc, curr_time):
+    from datetime import timedelta
+    target_dt = epoch_utc + timedelta(seconds=curr_time)
+    jd, fr = jday(
+        target_dt.year, target_dt.month, target_dt.day,
+        target_dt.hour, target_dt.minute, target_dt.second + target_dt.microsecond * 1e-6
+    )
+    
+    xs, ys, zs = [], [], []
+    for sat in sat_objects:
+        error, r, v = sat.sgp4(jd, fr)
+        if error == 0:
+            xs.append(r[0])  # SGP4 returns km
+            ys.append(r[1])
+            zs.append(r[2])
+    return np.array(xs), np.array(ys), np.array(zs)
+
 
 def get_tle_initial_state(l1, l2, epoch_utc):
+
     try:
         sat = Satrec.twoline2rv(l1, l2)
         jd, fr = jday(
@@ -183,95 +221,142 @@ def run_tracking_pipeline(enable_noise, sigma_r, sigma_v, state_vector, filter_c
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=ROOT)
     return result.returncode, result.stdout
 
-def is_land(lat, lon):
-    """
-    Programmatic low-resolution continent bounding box lookup.
-    Used to texture the Earth sphere.
-    """
-    if lat < -60: # Antarctica
-        return True
-    if 15 <= lat <= 80 and -168 <= lon <= -50: # North America
-        return True
-    if -56 <= lat <= 15 and -82 <= lon <= -34: # South America
-        return True
-    if -35 <= lat <= 38 and -20 <= lon <= 51: # Africa
-        return True
-    if 10 <= lat <= 80 and -10 <= lon <= 170: # Eurasia
-        return True
-    if -45 <= lat <= -10 and 113 <= lon <= 153: # Australia
-        return True
+def _is_land(lat, lon):
+    """Coarse continent bounding boxes as fallback when no image available."""
+    if lat < -60:                                          return True   # Antarctica
+    if 15 <= lat <= 80 and -168 <= lon <= -50:             return True   # N America
+    if -56 <= lat <= 15 and -82 <= lon <= -34:             return True   # S America
+    if -35 <= lat <= 38 and -20 <= lon <= 51:              return True   # Africa
+    if 10 <= lat <= 80 and -10 <= lon <= 170:              return True   # Eurasia
+    if -45 <= lat <= -10 and 113 <= lon <= 153:            return True   # Australia
     return False
 
-@st.cache_data
-def get_earth_texture_colors(n):
+
+@st.cache_data(show_spinner=False)
+def get_earth_texture_colors(n_lon: int, n_lat: int):
     """
-    Tries to load or download an Earth texture image to map to the 3D sphere.
-    Falls back to analytical is_land if offline or failed.
+    Downloads (once) a Blue Marble Earth map and returns a 2-D surfacecolor
+    array shaped (n_lon, n_lat) aligned to Plotly Surface convention:
+
+        x[i, j] = R * cos(u[i]) * sin(v[j])
+        y[i, j] = R * sin(u[i]) * sin(v[j])
+        z[i, j] = R * cos(v[j])
+
+    where  u[i] = longitude  0 -> 2*pi  (left = 0 deg, right = 360 deg)
+           v[j] = colatitude 0 -> pi    (top  = North Pole)
+
+    surfacecolor[i, j]  maps to the point at (u[i], v[j]).
+    Image convention: col 0 = left edge (0 deg E), row 0 = top (90 deg N)
+    => after resize to (W=n_lon, H=n_lat):  gray[row, col] = gray[j, i]
+    => surfacecolor[i, j] = gray[j, i]  i.e. surfacecolor = gray.T
     """
-    u_vals = np.linspace(0, 2 * np.pi, n)
-    v_vals = np.linspace(0, np.pi, n)
-    cache_file = CACHE_DIR / "earth_lowres.jpg"
-    url = "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c4/Earthmap1000x500compac.jpg/640px-Earthmap1000x500compac.jpg"
-    
-    img_loaded = False
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = CACHE_DIR / "earth_blue_marble.jpg"
+
+    urls = [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c4/Earthmap1000x500compac.jpg/1280px-Earthmap1000x500compac.jpg",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c4/Earthmap1000x500compac.jpg/640px-Earthmap1000x500compac.jpg",
+    ]
+
     if not cache_file.exists():
         try:
             import requests
-            response = requests.get(url, timeout=3)
-            if response.status_code == 200:
-                CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                cache_file.write_bytes(response.content)
-                img_loaded = True
-        except Exception:
+            for url in urls:
+                try:
+                    resp = requests.get(url, timeout=10)
+                    if resp.status_code == 200 and len(resp.content) > 20_000:
+                        cache_file.write_bytes(resp.content)
+                        break
+                except Exception:
+                    continue
+        except ImportError:
             pass
-    else:
-        img_loaded = True
-        
-    if img_loaded:
+
+    if cache_file.exists():
         try:
-            import matplotlib.image as mpimg
-            img = mpimg.imread(str(cache_file))
-            H, W = img.shape[0], img.shape[1]
-            surface_colors = np.zeros((n, n))
-            
-            for i in range(n):
-                for j in range(n):
-                    # Map latitude and longitude grids to pixel rows/cols
-                    row = int(v_vals[j] / np.pi * (H - 1))
-                    col = int(((u_vals[i] / (2 * np.pi) + 0.5) % 1.0) * (W - 1))
-                    
-                    pixel = img[row, col]
-                    if len(pixel.shape) == 0:
-                        val = float(pixel)
-                    else:
-                        r, g, b = float(pixel[0]), float(pixel[1]), float(pixel[2])
-                        val = 0.2989 * r + 0.5870 * g + 0.1140 * b
-                    surface_colors[i, j] = val
-                    
-            # Normalize surface_colors
-            cmin, cmax = surface_colors.min(), surface_colors.max()
-            if cmax > cmin:
-                surface_colors = (surface_colors - cmin) / (cmax - cmin)
-            return surface_colors, True
+            from PIL import Image as _PILImg
+            img = _PILImg.open(str(cache_file)).convert("RGB")
+            # Resize so width = n_lon cols (longitude), height = n_lat rows (colatitude)
+            img = img.resize((n_lon, n_lat), _PILImg.LANCZOS)
+            arr = np.array(img, dtype=np.float32)           # shape (n_lat, n_lon, 3)
+            # Luminance
+            gray = 0.2989 * arr[:, :, 0] + 0.5870 * arr[:, :, 1] + 0.1140 * arr[:, :, 2]
+            # Roll columns by n_lon // 2 to align 0 longitude with the center of the image
+            gray = np.roll(gray, n_lon // 2, axis=1)
+            # gray[row, col] = gray[j, i]  -> transpose to get [i, j]
+            sc = gray.T.astype(np.float32)                   # shape (n_lon, n_lat)
+            lo, hi = sc.min(), sc.max()
+            if hi > lo:
+                sc = (sc - lo) / (hi - lo)
+            return sc, True
         except Exception:
             pass
-            
-    # Fallback to programmatic continents
-    surface_colors = np.zeros((n, n))
-    for i, u in enumerate(u_vals):
-        for j, v in enumerate(v_vals):
+
+    # Fallback: analytical continent bounding boxes
+    u_v = np.linspace(0, 2 * np.pi, n_lon)
+    v_v = np.linspace(0, np.pi, n_lat)
+    sc = np.zeros((n_lon, n_lat), dtype=np.float32)
+    for i, u in enumerate(u_v):
+        lon_deg = np.degrees(u)
+        if lon_deg > 180.0:
+            lon_deg -= 360.0
+        for j, v in enumerate(v_v):
             lat_deg = 90.0 - np.degrees(v)
-            lon_deg = np.degrees(u) - 180.0
-            if is_land(lat_deg, lon_deg):
-                surface_colors[i, j] = 1.0
-            else:
-                surface_colors[i, j] = 0.0
-    return surface_colors, False
+            if _is_land(lat_deg, lon_deg):
+                sc[i, j] = 1.0
+    return sc, False
+
+
+def get_visibility_cone_mesh(gs_lat, gs_lon, gs_alt, mask_deg=10.0, height_km=1500.0):
+    gs_ecef = lla_to_ecef(gs_lat, gs_lon, gs_alt) / 1000.0 # convert to km
+    
+    rad_lat = np.radians(gs_lat)
+    rad_lon = np.radians(gs_lon)
+    
+    # Zenith direction (normal to WGS84 ellipsoid at gs_lat, gs_lon)
+    zenith = np.array([
+        np.cos(rad_lat) * np.cos(rad_lon),
+        np.cos(rad_lat) * np.sin(rad_lon),
+        np.sin(rad_lat)
+    ])
+    
+    # Create two orthogonal vectors in the tangent plane
+    if abs(zenith[0]) < 0.9:
+        ortho1 = np.cross(zenith, np.array([1.0, 0.0, 0.0]))
+    else:
+        ortho1 = np.cross(zenith, np.array([0.0, 1.0, 0.0]))
+    ortho1 /= np.linalg.norm(ortho1)
+    ortho2 = np.cross(zenith, ortho1)
+    
+    # Generate cone mesh grid  (vectorised)
+    n_theta = 48
+    n_h = 12
+    theta_vals = np.linspace(0, 2 * np.pi, n_theta)
+    h_vals = np.linspace(0, height_km, n_h)
+    half_angle = np.radians(90.0 - mask_deg)
+
+    # Shape: (n_h,)  and  (n_theta,) broadcast to (n_h, n_theta)
+    r_vals = h_vals[:, None] * np.tan(half_angle)            # (n_h, 1)
+    cos_th = np.cos(theta_vals)[None, :]                     # (1, n_theta)
+    sin_th = np.sin(theta_vals)[None, :]                     # (1, n_theta)
+
+    # gs_ecef + h*zenith + r*(cos*o1 + sin*o2)
+    pts = (gs_ecef[:, None, None]                            # (3,1,1)
+           + h_vals[None, :, None] * zenith[:, None, None]  # (3,n_h,1)
+           + r_vals[None, :, :] * (cos_th * ortho1[:, None, None]
+                                   + sin_th * ortho2[:, None, None]))  # (3,n_h,n_theta)
+
+    x_c = pts[0]   # (n_h, n_theta)
+    y_c = pts[1]
+    z_c = pts[2]
+
+    return x_c, y_c, z_c
 
 
 
 def lla_to_ecef(lat, lon, alt):
     rad_lat = np.radians(lat)
+
     rad_lon = np.radians(lon)
     a = 6378137.0
     f = 1.0 / 298.257223563
@@ -420,7 +505,45 @@ gs_lat = st.sidebar.number_input("Latitude (deg)", value=13.0827, step=0.01)
 gs_lon = st.sidebar.number_input("Longitude (deg)", value=80.2707, step=0.01)
 gs_alt = st.sidebar.number_input("Altitude (m)", value=10.0, step=1.0)
 
+# Global Mission Clock & Animator
+st.sidebar.markdown("---")
+st.sidebar.markdown("**⏳ Global Mission Clock & Viewport**")
+constellation_density = st.sidebar.selectbox(
+    "Constellation Density",
+    ["Disabled", "Low (500 sats)", "Medium (1,500 sats)", "High (5,000 sats)", "Full (15,000 sats)"],
+    index=2
+)
+view_mode = st.sidebar.selectbox(
+    "3D Camera Zoom Focus",
+    ["Target Orbit (Auto)", "LEO Zoom (~8,500 km)", "MEO Zoom (~25,000 km)", "GEO Zoom (~45,000 km)"],
+    index=0
+)
+play_mode = st.sidebar.checkbox("▶️ Auto-Play Animation", value=False)
+anim_speed = st.sidebar.slider("Animation Speed (steps/frame)", 1, 20, 3, 1) if play_mode else 3
+
+if "timeline_step" not in st.session_state:
+    st.session_state.timeline_step = 0
+
+if play_mode:
+    st.session_state.timeline_step = (st.session_state.timeline_step + anim_speed) % steps
+
+# Clamp in case steps slider changed
+st.session_state.timeline_step = min(st.session_state.timeline_step, steps - 1)
+
+step_idx = st.sidebar.slider(
+    "Timeline Step Index",
+    min_value=0, max_value=steps - 1,
+    value=st.session_state.timeline_step,
+    disabled=play_mode
+)
+if not play_mode:
+    st.session_state.timeline_step = step_idx
+
+curr_time = step_idx * dt
+
+
 # Define file paths
+
 truth_path = GENERATED_DIR / "truth.csv"
 observed_path = GENERATED_DIR / "observed.csv"
 estimated_path = GENERATED_DIR / "estimated.csv"
@@ -532,84 +655,170 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "⚠️ Conjunction Warnings"
 ])
 
-# ------------------------------------------------------------
-# Tab 1: 3D Orbit Map with realistic Earth globe
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+# Tab 1: Live 3D Globe
+# ─────────────────────────────────────────────────────────────
 with tab1:
-    st.markdown("### 🌐 Interactive 3D Orbit Viewer")
-    st.markdown("Visualize orbits in Earth-Centered Inertial (ECI) coordinate frame over a programmatically textured Earth globe.")
-    
-    fig_3d = go.Figure()
-    
-    # 1. Add Textured Earth Sphere
-    R_EARTH_KM = 6378.137
-    n = 72
-    u_vals = np.linspace(0, 2 * np.pi, n)
-    v_vals = np.linspace(0, np.pi, n)
-    
-    # Coordinates of sphere
-    x_e = R_EARTH_KM * np.outer(np.cos(u_vals), np.sin(v_vals))
-    y_e = R_EARTH_KM * np.outer(np.sin(u_vals), np.sin(v_vals))
-    z_e = R_EARTH_KM * np.outer(np.ones_like(u_vals), np.cos(v_vals))
-    
-    # Generate Earth colors from texture or fallback
-    surface_colors, is_textured = get_earth_texture_colors(n)
+    st.markdown("### 🌐 Live 3D ECI Orbit Viewer")
+    st.markdown(
+        f"Epoch **{epoch_utc.strftime('%Y-%m-%d %H:%M UTC')}** · "
+        f"T+**{curr_time:.0f} s** (step {step_idx}/{steps})"
+    )
 
-                
-    # High-fidelity Earth colorscale mapping grayscale values
+    fig_3d = go.Figure()
+
+    # ── 1. Earth Globe ──────────────────────────────────────
+    R_E = 6378.137  # km
+    omega_e = 7.292115e-5  # rad/s
+    theta_rotation = omega_e * curr_time
+
+    # u = longitude  0…2π  (N_LON points) with dynamic rotation in ECI
+    # v = colatitude 0…π   (N_LAT points)
+    N_LON, N_LAT = 180, 90
+    u = np.linspace(0, 2 * np.pi, N_LON) + theta_rotation
+    v = np.linspace(0, np.pi,     N_LAT)
+
+    # Sphere: x[i,j] corresponds to longitude u[i], colatitude v[j]
+    x_e = R_E * np.outer(np.cos(u), np.sin(v))   # (N_LON, N_LAT)
+    y_e = R_E * np.outer(np.sin(u), np.sin(v))   # (N_LON, N_LAT)
+    z_e = R_E * np.outer(np.ones(N_LON), np.cos(v))  # (N_LON, N_LAT)
+
+    # surfacecolor[i,j] → point (u[i], v[j])
+    surface_colors, is_textured = get_earth_texture_colors(N_LON, N_LAT)
+
     if is_textured:
         earth_colorscale = [
-            [0.0, '#050b14'],   # Space/very deep ocean
-            [0.15, '#081726'],  # Deep ocean
-            [0.4, '#0f2b48'],   # Medium ocean
-            [0.48, '#1d4872'],  # Coastal water
-            [0.51, '#7bb8d8'],  # Shallow/reef
-            [0.53, '#d5c396'],  # Beach/sand
-            [0.57, '#5d8a66'],  # Grass/vegetation
-            [0.68, '#3c6e47'],  # Forest green
-            [0.78, '#2e5138'],  # Dense forest
-            [0.85, '#5c4e3c'],  # Hills/dry land
-            [0.93, '#423528'],  # Mountains
-            [1.0, '#ffffff']    # Snow/clouds
+            [0.00, '#03111f'],   # deep ocean
+            [0.08, '#04213d'],
+            [0.20, '#0c3b68'],   # mid-ocean
+            [0.38, '#1a5a8a'],   # shallow
+            [0.48, '#2e7aad'],
+            [0.50, '#c8b98a'],   # coastline/sand
+            [0.52, '#6b9c5e'],   # lowland green
+            [0.62, '#4a7d43'],   # forest
+            [0.72, '#3a6335'],
+            [0.82, '#6b5e47'],   # highlands/rock
+            [0.91, '#8a7a68'],   # mountains
+            [1.00, '#e8e8e8'],   # snow/icecaps
         ]
     else:
-        # Fallback simplified green/blue colorscale
         earth_colorscale = [
-            [0.0, '#0a1128'],  # Deep ocean
-            [0.49, '#1c2d5a'], # Shallow water
-            [0.5, '#2d5a27'],  # Coast/land green
-            [1.0, '#193b16']   # Forest green
+            [0.0, '#04213d'],
+            [0.49, '#1a5a8a'],
+            [0.50, '#3a6335'],
+            [1.0,  '#4a7d43'],
         ]
 
-    
     fig_3d.add_trace(go.Surface(
         x=x_e, y=y_e, z=z_e,
         surfacecolor=surface_colors,
         colorscale=earth_colorscale,
         showscale=False,
-        opacity=0.9,
+        opacity=1.0,
         name="Earth",
-        hoverinfo="skip"
+        hoverinfo="skip",
+        lightposition=dict(x=2, y=1, z=1),
+        lighting=dict(ambient=0.45, diffuse=0.7, specular=0.3, roughness=0.8)
     ))
-    
-    # Add Gridlines
-    for lat in np.linspace(-np.pi/2, np.pi/2, 9):
-        theta = np.linspace(0, 2*np.pi, 72)
-        gl_x = R_EARTH_KM * np.cos(lat) * np.cos(theta)
-        gl_y = R_EARTH_KM * np.cos(lat) * np.sin(theta)
-        gl_z = R_EARTH_KM * np.sin(lat) * np.ones_like(theta)
-        fig_3d.add_trace(go.Scatter3d(x=gl_x, y=gl_y, z=gl_z, mode='lines', line=dict(color='rgba(255,255,255,0.08)', width=1), showlegend=False, hoverinfo='skip'))
-        
-    for lon in np.linspace(0, 2*np.pi, 12):
-        phi = np.linspace(-np.pi/2, np.pi/2, 72)
-        gl_x = R_EARTH_KM * np.cos(phi) * np.cos(lon)
-        gl_y = R_EARTH_KM * np.cos(phi) * np.sin(lon)
-        gl_z = R_EARTH_KM * np.sin(phi)
-        fig_3d.add_trace(go.Scatter3d(x=gl_x, y=gl_y, z=gl_z, mode='lines', line=dict(color='rgba(255,255,255,0.08)', width=1), showlegend=False, hoverinfo='skip'))
-        
-    # 2. Plot Trajectories
+
+    # ── 1a. Lat/Lon grid lines ───────────────────────────────
+    for lat_deg in np.arange(-75, 91, 15):
+        lat_r = np.radians(lat_deg)
+        th = np.linspace(0, 2 * np.pi, 181)
+        fig_3d.add_trace(go.Scatter3d(
+            x=R_E * np.cos(lat_r) * np.cos(th),
+            y=R_E * np.cos(lat_r) * np.sin(th),
+            z=R_E * np.sin(lat_r) * np.ones_like(th),
+            mode='lines', line=dict(color='rgba(255,255,255,0.07)', width=1),
+            showlegend=False, hoverinfo='skip'
+        ))
+
+    for lon_deg in np.arange(0, 360, 30):
+        lon_r = np.radians(lon_deg) + theta_rotation
+        ph = np.linspace(-np.pi / 2, np.pi / 2, 91)
+        fig_3d.add_trace(go.Scatter3d(
+            x=R_E * np.cos(ph) * np.cos(lon_r),
+            y=R_E * np.cos(ph) * np.sin(lon_r),
+            z=R_E * np.sin(ph),
+            mode='lines', line=dict(color='rgba(255,255,255,0.07)', width=1),
+            showlegend=False, hoverinfo='skip'
+        ))
+
+    # Equator highlight
+    th = np.linspace(0, 2 * np.pi, 361)
+    fig_3d.add_trace(go.Scatter3d(
+        x=R_E * np.cos(th), y=R_E * np.sin(th), z=np.zeros_like(th),
+        mode='lines', line=dict(color='rgba(255,180,50,0.22)', width=1.5),
+        showlegend=False, hoverinfo='skip'
+    ))
+
+    # ── 2. Ground Station (Earth-Rotating in ECI) ────────────
+    rotated_lon = gs_lon + np.degrees(omega_e * curr_time)
+    gs_pt = lla_to_ecef(gs_lat, rotated_lon, gs_alt) / 1000.0
+
+    fig_3d.add_trace(go.Scatter3d(
+        x=[gs_pt[0]], y=[gs_pt[1]], z=[gs_pt[2]],
+        mode='markers+text',
+        marker=dict(color='#10b981', size=7, symbol='diamond',
+                    line=dict(color='#ffffff', width=1)),
+        text=['GS'], textposition='top center',
+        name='Ground Station'
+    ))
+
+    # Visibility cone
+    cx, cy, cz = get_visibility_cone_mesh(gs_lat, rotated_lon, gs_alt, mask_deg=10.0, height_km=1500.0)
+    fig_3d.add_trace(go.Surface(
+        x=cx, y=cy, z=cz,
+        colorscale=[[0, 'rgba(16,185,129,0.18)'], [1, 'rgba(16,185,129,0.01)']],
+        showscale=False, name='Visibility Cone',
+        hoverinfo='skip', opacity=0.7
+    ))
+
+    # ── 3. Satellite Constellation Point Cloud ───────────────
+    if constellation_density != "Disabled":
+        sat_objects, sat_names_list = get_satrec_objects()
+        if sat_objects:
+            total_sats = len(sat_objects)
+            if constellation_density == "Low (500 sats)":
+                step = max(1, total_sats // 500)
+                sats_to_prop = sat_objects[::step]
+            elif constellation_density == "Medium (1,500 sats)":
+                step = max(1, total_sats // 1500)
+                sats_to_prop = sat_objects[::step]
+            elif constellation_density == "High (5,000 sats)":
+                step = max(1, total_sats // 5000)
+                sats_to_prop = sat_objects[::step]
+            else:
+                sats_to_prop = sat_objects
+
+            s_xs, s_ys, s_zs = propagate_constellation(sats_to_prop, epoch_utc, curr_time)
+            alts = np.sqrt(s_xs ** 2 + s_ys ** 2 + s_zs ** 2) - R_E
+            fig_3d.add_trace(go.Scatter3d(
+                x=s_xs, y=s_ys, z=s_zs,
+                mode='markers',
+                marker=dict(
+                    size=1.2,
+                    color=alts,
+                    colorscale='Viridis',
+                    cmin=200, cmax=36000,
+                    opacity=0.5,
+                    colorbar=dict(
+                        title=dict(
+                            text="Alt (km)",
+                            font=dict(color="#94a3b8", size=10)
+                        ),
+                        thickness=8, len=0.4, y=0.18,
+                        tickfont=dict(color="#94a3b8", size=10)
+                    )
+                ),
+                name="Active Constellation",
+                hoverinfo="skip"
+            ))
+
+    # ── 4. Target Satellite Trajectories ─────────────────────
     if truth_path.exists():
         df_truth = pd.read_csv(truth_path)
+
         fig_3d.add_trace(go.Scatter3d(
             x=df_truth['x'] / 1000.0,
             y=df_truth['y'] / 1000.0,
@@ -618,87 +827,113 @@ with tab1:
             line=dict(color='#10b981', width=3.5),
             name="Ground Truth"
         ))
-        
+
+        if len(df_truth) > step_idx:
+            pt = df_truth.iloc[step_idx]
+            fig_3d.add_trace(go.Scatter3d(
+                x=[pt['x'] / 1000.0], y=[pt['y'] / 1000.0], z=[pt['z'] / 1000.0],
+                mode='markers+text',
+                marker=dict(color='#d946ef', size=9, symbol='circle',
+                            line=dict(color='#ffffff', width=1.5)),
+                text=[tle_name[:20]], textposition='top center',
+                name='Target (Now)'
+            ))
+
     if estimated_path.exists():
         df_est = pd.read_csv(estimated_path)
         fig_3d.add_trace(go.Scatter3d(
-            x=df_est['x'] / 1000.0,
-            y=df_est['y'] / 1000.0,
-            z=df_est['z'] / 1000.0,
-            mode='lines',
-            line=dict(color='#06b6d4', width=2.5, dash='dash'),
+            x=df_est['x'] / 1000.0, y=df_est['y'] / 1000.0, z=df_est['z'] / 1000.0,
+            mode='lines', line=dict(color='#06b6d4', width=2, dash='dash'),
             name="Estimated (Batch)"
         ))
-        
+
     if ekf_path.exists():
         df_ekf = pd.read_csv(ekf_path)
         fig_3d.add_trace(go.Scatter3d(
-            x=df_ekf['x'] / 1000.0,
-            y=df_ekf['y'] / 1000.0,
-            z=df_ekf['z'] / 1000.0,
-            mode='lines',
-            line=dict(color='#d946ef', width=2.5, dash='dot'),
+            x=df_ekf['x'] / 1000.0, y=df_ekf['y'] / 1000.0, z=df_ekf['z'] / 1000.0,
+            mode='lines', line=dict(color='#a855f7', width=2, dash='dot'),
             name=f"Sequential ({filter_choice})"
         ))
-        
+
     if observed_path.exists() and enable_noise:
         df_obs = pd.read_csv(observed_path)
-        step_sample = max(1, len(df_obs) // 60)
-        df_obs_sampled = df_obs.iloc[::step_sample]
+        samp = max(1, len(df_obs) // 80)
+        df_s = df_obs.iloc[::samp]
         fig_3d.add_trace(go.Scatter3d(
-            x=df_obs_sampled['x'] / 1000.0,
-            y=df_obs_sampled['y'] / 1000.0,
-            z=df_obs_sampled['z'] / 1000.0,
+            x=df_s['x'] / 1000.0, y=df_s['y'] / 1000.0, z=df_s['z'] / 1000.0,
             mode='markers',
-            marker=dict(color='#ef4444', size=3, opacity=0.8),
+            marker=dict(color='#ef4444', size=2.5, opacity=0.7),
             name="Noisy Observations"
         ))
-        
-    # 3. Add Close Approaches
+
+    # ── 5. Close Approach Lines ──────────────────────────────
     threshold_m = warning_threshold_km * 1000.0
-    valid_conjs = [c for c in conjunctions if c['min_distance_m'] <= threshold_m]
-    
-    for c in valid_conjs[:5]:
-        sat_pos = np.array(c['sat_position_m'])
-        rel_pos = np.array(c['relative_position_m'])
-        target_pos = sat_pos - rel_pos
-        
-        t_pos_km = target_pos / 1000.0
-        s_pos_km = sat_pos / 1000.0
-        
+    for c in conjunctions[:5]:
+        if c['min_distance_m'] > threshold_m:
+            continue
+        sat_pos = np.array(c['sat_position_m']) / 1000.0
+        tgt_pos = (np.array(c['sat_position_m']) - np.array(c['relative_position_m'])) / 1000.0
         fig_3d.add_trace(go.Scatter3d(
-            x=[t_pos_km[0], s_pos_km[0]],
-            y=[t_pos_km[1], s_pos_km[1]],
-            z=[t_pos_km[2], s_pos_km[2]],
+            x=[tgt_pos[0], sat_pos[0]],
+            y=[tgt_pos[1], sat_pos[1]],
+            z=[tgt_pos[2], sat_pos[2]],
             mode='lines+markers',
             line=dict(color='#f59e0b', width=3, dash='longdash'),
             marker=dict(size=4, color=['#06b6d4', '#ef4444']),
-            name=f"Approach: {c['sat_name']} ({c['min_distance_m']/1000.0:.2f} km)"
+            name=f"Approach: {c['sat_name'][:18]} ({c['min_distance_m']/1000.0:.1f} km)"
         ))
 
-    # Layout styling
+    # ── 5. Viewport Limit calculation ────────────────────────
+    limit = 8500.0  # default for LEO
+    if view_mode == "Target Orbit (Auto)":
+        if truth_path.exists():
+            try:
+                df_truth = pd.read_csv(truth_path)
+                max_r = np.sqrt(df_truth['x']**2 + df_truth['y']**2 + df_truth['z']**2).max() / 1000.0
+                limit = max(8500.0, max_r * 1.15)
+            except Exception:
+                limit = 8500.0
+    elif view_mode == "LEO Zoom (~8,500 km)":
+        limit = 8500.0
+    elif view_mode == "MEO Zoom (~25,000 km)":
+        limit = 25000.0
+    elif view_mode == "GEO Zoom (~45,000 km)":
+        limit = 45000.0
+
+    # ── Layout ───────────────────────────────────────────────
     fig_3d.update_layout(
         scene=dict(
-            xaxis=dict(backgroundcolor="rgba(0,0,0,0)", gridcolor="#1e293b", showbackground=False, title="X (km)", color="#94a3b8"),
-            yaxis=dict(backgroundcolor="rgba(0,0,0,0)", gridcolor="#1e293b", showbackground=False, title="Y (km)", color="#94a3b8"),
-            zaxis=dict(backgroundcolor="rgba(0,0,0,0)", gridcolor="#1e293b", showbackground=False, title="Z (km)", color="#94a3b8"),
-            aspectmode='data'
+            bgcolor='rgba(2,5,15,1)',
+            xaxis=dict(showbackground=False, showgrid=False,
+                       zeroline=False, showticklabels=False, title="", range=[-limit, limit]),
+            yaxis=dict(showbackground=False, showgrid=False,
+                       zeroline=False, showticklabels=False, title="", range=[-limit, limit]),
+            zaxis=dict(showbackground=False, showgrid=False,
+                       zeroline=False, showticklabels=False, title="", range=[-limit, limit]),
+            aspectmode='manual',
+            aspectratio=dict(x=1, y=1, z=1),
+            camera=dict(
+                eye=dict(x=1.5, y=1.5, z=1.0),
+                up=dict(x=0, y=0, z=1),
+                center=dict(x=0, y=0, z=0)
+            )
         ),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(2,5,15,1)',
+        plot_bgcolor='rgba(2,5,15,1)',
         margin=dict(l=0, r=0, b=0, t=0),
         legend=dict(
-            yanchor="top",
-            y=0.95,
-            xanchor="left",
-            x=0.02,
-            font=dict(color="#f3f4f6"),
-            bgcolor="rgba(3,7,18,0.75)"
+            yanchor="top", y=0.97, xanchor="left", x=0.01,
+            font=dict(color="#cbd5e1", size=11),
+            bgcolor="rgba(3,7,18,0.82)",
+            bordercolor="#1e293b", borderwidth=1
         ),
-        height=750
+        height=780,
+        uirevision="globe"  # Preserve camera across reruns
     )
-    
-    st.plotly_chart(fig_3d, use_container_width=True)
+
+    st.plotly_chart(fig_3d, width="stretch")
+
+
 
 # ------------------------------------------------------------
 # Tab 2: Ground Tracks
@@ -710,9 +945,9 @@ with tab2:
         df_truth_lla = pd.read_csv(truth_lla_path)
         times_list = df_truth_lla['time'].tolist()
         
-        step_idx = st.slider("Time timeline scrub", min_value=0, max_value=len(times_list)-1, value=0)
-        curr_time = times_list[step_idx]
-        curr_pt = df_truth_lla.iloc[step_idx]
+        safe_idx = min(step_idx, len(df_truth_lla) - 1)
+        curr_pt = df_truth_lla.iloc[safe_idx]
+
         
         st.markdown(f"**Current position at T+{curr_time:.1f} s:** Lat = `{curr_pt['lat']:.4f}°`, Lon = `{curr_pt['lon']:.4f}°`")
         
@@ -769,7 +1004,7 @@ with tab2:
             height=600
         )
         
-        st.plotly_chart(fig_gt, use_container_width=True)
+        st.plotly_chart(fig_gt, width="stretch")
 
 # ------------------------------------------------------------
 # Tab 3: Error & Residuals
@@ -815,7 +1050,7 @@ with tab3:
         )
         
         with col_err1:
-            st.plotly_chart(fig_pos, use_container_width=True)
+            st.plotly_chart(fig_pos, width="stretch")
             
         # Velocity Errors
         vel_err_batch = np.sqrt((df_e['vx'] - df_t['vx'])**2 + (df_e['vy'] - df_t['vy'])**2 + (df_e['vz'] - df_t['vz'])**2)
@@ -848,7 +1083,7 @@ with tab3:
         )
         
         with col_err2:
-            st.plotly_chart(fig_vel, use_container_width=True)
+            st.plotly_chart(fig_vel, width="stretch")
 
 # ------------------------------------------------------------
 # Tab 4: B-Plane Risk Analysis
@@ -976,7 +1211,7 @@ with tab4:
                     height=550
                 )
                 
-                st.plotly_chart(fig_bp, use_container_width=True)
+                st.plotly_chart(fig_bp, width="stretch")
 
 # ------------------------------------------------------------
 # Tab 5: Pass Planner
@@ -1041,7 +1276,7 @@ with tab5:
                 font=dict(color="#f3f4f6"),
                 legend=dict(bgcolor="rgba(3,7,18,0.75)")
             )
-            st.plotly_chart(fig_pass, use_container_width=True)
+            st.plotly_chart(fig_pass, width="stretch")
 
 # ------------------------------------------------------------
 # Tab 6: Conjunction warnings
@@ -1081,3 +1316,10 @@ with tab6:
             
         df_table = pd.DataFrame(rows)
         st.write(df_table.to_html(escape=False, index=False), unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────
+# Auto-play loop – trigger rerun after brief sleep
+# ─────────────────────────────────────────────────────────────
+if play_mode:
+    time.sleep(0.08)
+    st.rerun()
