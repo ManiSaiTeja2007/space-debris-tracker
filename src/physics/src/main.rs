@@ -7,6 +7,7 @@ mod third_body;
 mod srp;
 mod dynamics;
 mod rk4;
+mod rk45;
 mod propagator;
 mod noise;
 mod estimation;

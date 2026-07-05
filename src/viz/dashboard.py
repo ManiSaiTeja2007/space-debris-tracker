@@ -125,6 +125,26 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+ST_CARD_STYLE = """
+<style>
+.orbit-kpi-row { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
+.orbit-kpi { background: linear-gradient(135deg,#0b1128,#0f1a35); border-radius:12px; padding:14px 18px;
+             border:1px solid #1e2d4a; flex:1; min-width:130px; text-align:center; }
+.orbit-kpi .lbl { font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:.08em; }
+.orbit-kpi .val { font-size:18px; font-weight:800; color:#00f0ff; }
+.orbit-kpi .unit { font-size:10px; color:#475569; margin-top:2px; }
+.timeline-jump-row { display:flex; gap:8px; margin:10px 0; flex-wrap:wrap; }
+.avoidance-card { background:linear-gradient(135deg,#1a0520,#1f0530); border:1px solid #7c3aed;
+                  border-radius:14px; padding:18px 22px; margin:12px 0; }
+.avoidance-card h4 { color:#d946ef; margin:0 0 8px 0; font-size:14px; }
+.avoidance-rec { font-size:22px; font-weight:800; color:#a855f7; margin:6px 0; }
+.avoidance-detail { font-size:12px; color:#94a3b8; }
+.tle-age-ok  { color:#10b981; font-size:11px; font-weight:600; }
+.tle-age-warn{ color:#f59e0b; font-size:11px; font-weight:600; }
+.tle-age-old { color:#ef4444; font-size:11px; font-weight:600; }
+</style>
+"""
+
 
 # ============================================================
 # Helper Functions
@@ -217,15 +237,271 @@ def run_tracking_pipeline(enable_noise, sigma_r, sigma_v, state_vector, filter_c
     ]
     if state_vector:
         cmd.extend(["--state"] + [str(x) for x in state_vector])
-    
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=ROOT)
     return result.returncode, result.stdout
+
+
+# ============================================================
+# Advanced Analytics Helper Functions
+# ============================================================
+
+MU_EARTH_KM3 = 398600.4418  # km³/s²
+
+def state_to_elements(r_km, v_km_s):
+    """Convert ECI state to classical Keplerian orbital elements."""
+    r = np.asarray(r_km, dtype=float)
+    v = np.asarray(v_km_s, dtype=float)
+    r_norm = np.linalg.norm(r)
+    v_norm = np.linalg.norm(v)
+    eps = 0.5 * v_norm**2 - MU_EARTH_KM3 / r_norm
+    if abs(eps) < 1e-12:
+        return None
+    a = -MU_EARTH_KM3 / (2.0 * eps)
+    h_vec = np.cross(r, v)
+    h_norm = np.linalg.norm(h_vec)
+    e_vec = np.cross(v, h_vec) / MU_EARTH_KM3 - r / r_norm
+    e = np.linalg.norm(e_vec)
+    i = np.degrees(np.arccos(np.clip(h_vec[2] / h_norm, -1.0, 1.0)))
+    T_min = 2.0 * np.pi * np.sqrt(max(a, 1.0)**3 / MU_EARTH_KM3) / 60.0
+    return {"a_km": a, "e": e, "i_deg": i, "T_min": T_min}
+
+
+def compute_eclipse_mask(df_truth_m, epoch_utc):
+    """Return boolean array True = in Earth shadow using sun ephemeris."""
+    R_E = 6378.137  # km
+    AU = 1.495978707e8  # km
+    mask = []
+    for _, row in df_truth_m.iterrows():
+        t_sec = float(row['time'])
+        days = 8765.5 + t_sec / 86400.0
+        g = np.radians((357.528 + 0.9856003 * days) % 360.0)
+        l = np.radians((280.460 + 0.9856474 * days) % 360.0)
+        lam = l + np.radians(1.915 * np.sin(g) + 0.020 * np.sin(2 * g))
+        obliq = np.radians(23.439)
+        r_sun = np.array([AU * np.cos(lam),
+                           AU * np.sin(lam) * np.cos(obliq),
+                           AU * np.sin(lam) * np.sin(obliq)])
+        r_sat = np.array([row['x'] / 1000.0, row['y'] / 1000.0, row['z'] / 1000.0])
+        u_sun = r_sun / np.linalg.norm(r_sun)
+        d_along = np.dot(r_sat, u_sun)
+        in_shadow = False
+        if d_along < 0.0:
+            r_sq = np.dot(r_sat, r_sat)
+            d_perp = np.sqrt(max(0.0, r_sq - d_along * d_along))
+            in_shadow = d_perp < R_E
+        mask.append(in_shadow)
+    return np.array(mask)
+
+
+def get_covariance_ellipsoid_mesh(pos_km, cov_row, scale_factor=500.0, sigma=3.0):
+    """Eigen-decompose 3x3 position covariance and return ellipsoid surface mesh in ECI km."""
+    P3 = np.array([
+        [cov_row['p_xx'], cov_row['p_xy'], cov_row['p_xz']],
+        [cov_row['p_xy'], cov_row['p_yy'], cov_row['p_yz']],
+        [cov_row['p_xz'], cov_row['p_yz'], cov_row['p_zz']]
+    ], dtype=float)
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(P3)
+    except Exception:
+        return None
+    eigenvalues = np.maximum(eigenvalues, 1e-12)
+    semi_axes = sigma * np.sqrt(eigenvalues) * scale_factor / 1000.0  # m -> km scaled
+    n_u, n_v = 32, 18
+    u_p = np.linspace(0, 2 * np.pi, n_u)
+    v_p = np.linspace(0, np.pi, n_v)
+    xs = semi_axes[0] * np.outer(np.cos(u_p), np.sin(v_p))
+    ys = semi_axes[1] * np.outer(np.sin(u_p), np.sin(v_p))
+    zs = semi_axes[2] * np.outer(np.ones(n_u), np.cos(v_p))
+    pts = np.stack([xs.ravel(), ys.ravel(), zs.ravel()])
+    rot = eigenvectors @ pts
+    return (rot[0].reshape(n_u, n_v) + pos_km[0],
+            rot[1].reshape(n_u, n_v) + pos_km[1],
+            rot[2].reshape(n_u, n_v) + pos_km[2])
+
+
+def detect_gs_passes(df_lla, gs_lat, gs_lon, gs_alt_m, el_mask_deg=10.0):
+    """Detect visibility pass windows. Returns list of {aos_time, los_time, max_el}."""
+    passes = []
+    in_pass = False
+    aos_t = 0.0
+    max_el = 0.0
+    for _, row in df_lla.iterrows():
+        try:
+            el, _, _ = calculate_elevation(row['lat'], row['lon'], row['alt'], gs_lat, gs_lon, gs_alt_m)
+        except Exception:
+            continue
+        if el >= el_mask_deg:
+            if not in_pass:
+                in_pass = True
+                aos_t = float(row['time'])
+                max_el = el
+            else:
+                max_el = max(max_el, el)
+        else:
+            if in_pass:
+                in_pass = False
+                passes.append({"aos_time": aos_t, "los_time": float(row['time']), "max_el": max_el})
+    if in_pass:
+        passes.append({"aos_time": aos_t, "los_time": float(df_lla['time'].iloc[-1]), "max_el": max_el})
+    return passes
+
+
+def build_event_timeline_chart(df_truth_m, df_ekf, conjunctions_list, man_time_s, passes, eclipse_mask):
+    """Annotated orbit profile timeline: altitude, speed, filter error with event markers."""
+    R_E = 6378.137
+    times = df_truth_m['time'].values
+    r = np.sqrt(df_truth_m['x']**2 + df_truth_m['y']**2 + df_truth_m['z']**2) / 1000.0
+    alt_km = r - R_E
+    speed = np.sqrt(df_truth_m['vx']**2 + df_truth_m['vy']**2 + df_truth_m['vz']**2) / 1000.0
+
+    filter_err = None
+    if df_ekf is not None and len(df_ekf) == len(df_truth_m):
+        filter_err = np.sqrt(
+            (df_ekf['x'].values - df_truth_m['x'].values)**2 +
+            (df_ekf['y'].values - df_truth_m['y'].values)**2 +
+            (df_ekf['z'].values - df_truth_m['z'].values)**2
+        )
+
+    fig = go.Figure()
+
+    # Eclipse shading bands
+    if eclipse_mask is not None and len(eclipse_mask) == len(times):
+        in_ecl = False
+        ecl_start = None
+        for t, ecl in zip(times, eclipse_mask):
+            if ecl and not in_ecl:
+                in_ecl = True
+                ecl_start = float(t)
+            elif not ecl and in_ecl:
+                in_ecl = False
+                fig.add_vrect(x0=ecl_start, x1=float(t),
+                              fillcolor='rgba(20,20,50,0.55)', layer='below', line_width=0)
+        if in_ecl:
+            fig.add_vrect(x0=ecl_start, x1=float(times[-1]),
+                          fillcolor='rgba(20,20,50,0.55)', layer='below', line_width=0)
+
+    # GS pass windows
+    for p in passes[:5]:
+        fig.add_vrect(x0=p['aos_time'], x1=p['los_time'],
+                      fillcolor='rgba(16,185,129,0.10)', layer='below', line_width=0)
+
+    # Altitude trace
+    fig.add_trace(go.Scatter(
+        x=times, y=alt_km, name='Altitude (km)',
+        mode='lines', line=dict(color='#06b6d4', width=2),
+        fill='tozeroy', fillcolor='rgba(6,182,212,0.07)', yaxis='y'
+    ))
+    # Speed trace
+    fig.add_trace(go.Scatter(
+        x=times, y=speed, name='Speed (km/s)',
+        mode='lines', line=dict(color='#a855f7', width=1.5, dash='dot'),
+        yaxis='y2', opacity=0.8
+    ))
+    # Filter error
+    if filter_err is not None:
+        fig.add_trace(go.Scatter(
+            x=times, y=filter_err, name='Filter Error (m)',
+            mode='lines', line=dict(color='#f43f5e', width=1.5),
+            yaxis='y', opacity=0.85
+        ))
+
+    # Event vertical lines
+    if man_time_s > 0:
+        fig.add_vline(x=man_time_s, line_dash='dash', line_color='#d946ef', line_width=2,
+                      annotation_text='🚀 Burn', annotation_position='top right',
+                      annotation_font_color='#d946ef', annotation_font_size=11)
+    if conjunctions_list:
+        tca = conjunctions_list[0].get('tca_seconds', 0)
+        fig.add_vline(x=tca, line_dash='dash', line_color='#f59e0b', line_width=2,
+                      annotation_text='⚠️ TCA', annotation_position='top left',
+                      annotation_font_color='#f59e0b', annotation_font_size=11)
+    for p in passes[:2]:
+        fig.add_vline(x=p['aos_time'], line_dash='longdash', line_color='#10b981', line_width=1,
+                      annotation_text='📡 AOS', annotation_position='top right',
+                      annotation_font_color='#10b981', annotation_font_size=9)
+        fig.add_vline(x=p['los_time'], line_dash='longdash', line_color='#ef4444', line_width=1,
+                      annotation_text='LOS', annotation_position='top left',
+                      annotation_font_color='#ef4444', annotation_font_size=9)
+
+    fig.update_layout(
+        height=240,
+        margin=dict(l=0, r=50, b=0, t=28),
+        paper_bgcolor='rgba(2,5,15,1)',
+        plot_bgcolor='rgba(5,10,25,0.8)',
+        title=dict(text='🛸 Mission Orbit Profile & Event Timeline',
+                   font=dict(color='#cbd5e1', size=13)),
+        xaxis=dict(title='Mission Time (s)', color='#64748b', gridcolor='#1e293b',
+                   tickfont=dict(size=10)),
+        yaxis=dict(title='Altitude (km) / Error (m)', color='#64748b',
+                   gridcolor='#1e293b', side='left'),
+        yaxis2=dict(title='Speed (km/s)', color='#a855f7', overlaying='y', side='right',
+                    showgrid=False, tickfont=dict(color='#a855f7', size=10)),
+        legend=dict(bgcolor='rgba(3,7,18,0.75)', font=dict(color='#cbd5e1', size=10),
+                    orientation='h', y=-0.28, x=0),
+        font=dict(color='#f3f4f6'),
+    )
+    return fig
+
+
+def compute_avoidance_burn_recommendation(target_pos_m, target_vel_m, tca_seconds, dt_s):
+    """
+    Search over candidate RIC burns [-2, +2] m/s to maximize miss distance at TCA.
+    Returns {dv_mag, component, projected_miss_km}.
+    Uses fast Euler integration as a proxy (called once per critical conjunction).
+    """
+    r_km = np.array(target_pos_m) / 1000.0
+    v_km_s = np.array(target_vel_m) / 1000.0
+    tca_steps = max(1, int(round(tca_seconds / dt_s)))
+
+    r_hat = r_km / np.linalg.norm(r_km)
+    h_vec = np.cross(r_km, v_km_s)
+    h_norm = np.linalg.norm(h_vec)
+    if h_norm < 1e-9:
+        return None
+    h_hat = h_vec / h_norm
+    t_hat = np.cross(h_hat, r_hat)
+    ric_axes = {"radial": r_hat, "in-track": t_hat, "cross-track": h_hat}
+
+    best = {"dv_mag": 0.0, "component": "in-track", "projected_miss_km": 0.0, "delta_miss_km": 0.0}
+
+    def propagate_fast(r0, v0, n_steps):
+        """Fast Euler propagation of Keplerian orbit."""
+        rr, vv = r0.copy(), v0.copy()
+        for _ in range(n_steps):
+            r_n = np.linalg.norm(rr)
+            a = -MU_EARTH_KM3 / r_n**3 * rr
+            vv = vv + a * dt_s
+            rr = rr + vv * dt_s
+        return rr
+
+    # Baseline position at TCA (no burn)
+    r_tca_base = propagate_fast(r_km, v_km_s, tca_steps)
+
+    for comp, axis in ric_axes.items():
+        for dv_m_s in np.arange(-2.0, 2.05, 0.25):
+            if abs(dv_m_s) < 0.1:
+                continue
+            dv_km_s = axis * dv_m_s / 1000.0  # m/s -> km/s
+            r_tca_new = propagate_fast(r_km, v_km_s + dv_km_s, tca_steps)
+            # Displacement from baseline = proxy for miss improvement
+            delta = np.linalg.norm(r_tca_new - r_tca_base)
+            if delta > best["projected_miss_km"]:
+                best = {
+                    "dv_mag": dv_m_s,
+                    "component": comp,
+                    "projected_miss_km": delta,
+                    "delta_miss_km": delta,
+                }
+    return best
+
+
 
 def _is_land(lat, lon):
     """Coarse continent bounding boxes as fallback when no image available."""
     if lat < -60:                                          return True   # Antarctica
     if 15 <= lat <= 80 and -168 <= lon <= -50:             return True   # N America
     if -56 <= lat <= 15 and -82 <= lon <= -34:             return True   # S America
+
     if -35 <= lat <= 38 and -20 <= lon <= 51:              return True   # Africa
     if 10 <= lat <= 80 and -10 <= lon <= 170:              return True   # Eurasia
     if -45 <= lat <= -10 and 113 <= lon <= 153:            return True   # Australia
@@ -449,8 +725,47 @@ if load_err:
 
 st.sidebar.header("🕹️ Controls & Config")
 
-# Satellite selector
-tle_names = [t[0] for t in tles]
+# ── Catalog Intelligence ─────────────────────────────────
+CONSTELLATIONS = {
+    "All": lambda name: True,
+    "Starlink": lambda name: "STARLINK" in name.upper(),
+    "OneWeb": lambda name: "ONEWEB" in name.upper(),
+    "GPS / NAVSTAR": lambda name: "GPS" in name.upper() or "NAVSTAR" in name.upper(),
+    "Iridium": lambda name: "IRIDIUM" in name.upper(),
+    "ISS / Tiangong": lambda name: "ISS" in name.upper() or "TIANHE" in name.upper() or "TIANGONG" in name.upper(),
+    "Debris Only": lambda name: "DEB" in name.upper() or "R/B" in name.upper() or "DEBRIS" in name.upper(),
+    "NOAA / GOES": lambda name: "NOAA" in name.upper() or "GOES" in name.upper(),
+}
+
+st.sidebar.markdown("**🛰️ Catalog Intelligence**")
+col_cat1, col_cat2 = st.sidebar.columns([2, 1])
+const_group = col_cat1.selectbox("Constellation", list(CONSTELLATIONS.keys()), index=0, label_visibility='collapsed')
+if col_cat2.button("🔄 Refresh", help="Force re-download TLE catalog"):
+    import shutil
+    tle_cache = CACHE_DIR / "active.tle"
+    if tle_cache.exists():
+        tle_cache.unlink()
+    st.cache_data.clear()
+    st.rerun()
+
+# TLE age badge
+tle_cache_path = CACHE_DIR / "active.tle"
+if tle_cache_path.exists():
+    import os
+    tle_age_days = (time.time() - os.path.getmtime(str(tle_cache_path))) / 86400.0
+    age_cls = "tle-age-ok" if tle_age_days < 1 else ("tle-age-warn" if tle_age_days < 3 else "tle-age-old")
+    age_icon = "✅" if tle_age_days < 1 else ("⚠️" if tle_age_days < 3 else "🔴")
+    st.sidebar.markdown(f'<span class="{age_cls}">{age_icon} TLE age: {tle_age_days:.1f}d</span>', unsafe_allow_html=True)
+
+sat_search = st.sidebar.text_input("🔍 Search Satellite", placeholder="e.g. ISS, Starlink-1234, 25544", label_visibility='visible')
+
+# Filter TLEs by constellation group and search term
+group_filter = CONSTELLATIONS[const_group]
+filtered_tles = [t for t in tles if group_filter(t[0]) and (not sat_search or sat_search.lower() in t[0].lower() or sat_search in t[1])]
+if not filtered_tles:
+    filtered_tles = tles  # fallback to all if nothing matches
+
+tle_names = [t[0] for t in filtered_tles]
 default_idx = 0
 for idx, name in enumerate(tle_names):
     if "ISS (ZARYA)" in name:
@@ -458,14 +773,15 @@ for idx, name in enumerate(tle_names):
         break
 
 selected_sat_name = st.sidebar.selectbox(
-    "Select Target Satellite/Debris",
+    "Target Satellite",
     options=tle_names,
-    index=default_idx,
-    help="Search and select a satellite from the active NORAD database."
+    index=min(default_idx, len(tle_names) - 1),
+    help="Filtered from NORAD active catalog."
 )
+st.sidebar.caption(f"{len(filtered_tles):,} satellites shown")
 
 # Extract selected TLE lines
-selected_tle = next(t for t in tles if t[0] == selected_sat_name)
+selected_tle = next((t for t in filtered_tles if t[0] == selected_sat_name), filtered_tles[0])
 tle_name, tle_l1, tle_l2 = selected_tle
 
 st.sidebar.markdown("---")
@@ -498,7 +814,25 @@ st_dvt = st.sidebar.number_input("ΔV In-Track (m/s)", value=0.0, step=0.1)
 st_dvn = st.sidebar.number_input("ΔV Cross-Track (m/s)", value=0.0, step=0.1)
 man_dv = [man_dvr, st_dvt, st_dvn]
 
-# Ground Station Planner
+# Visualization Controls
+st.sidebar.markdown("---")
+st.sidebar.markdown("**🔭 Visualization Settings**")
+ellipsoid_scale = st.sidebar.selectbox(
+    "3σ Uncertainty Ellipsoid",
+    ["Disabled", "1× (physical)", "100×", "500×", "1,000×", "5,000×"],
+    index=3,
+    help="Scale factor for covariance ellipsoid visibility at Earth scale."
+)
+ellipsoid_scale_map = {
+    "Disabled": 0,
+    "1× (physical)": 1,
+    "100×": 100,
+    "500×": 500,
+    "1,000×": 1000,
+    "5,000×": 5000,
+}
+ellipsoid_scale_val = ellipsoid_scale_map[ellipsoid_scale]
+
 st.sidebar.markdown("---")
 st.sidebar.markdown("**📡 Ground Station**")
 gs_lat = st.sidebar.number_input("Latitude (deg)", value=13.0827, step=0.01)
@@ -643,17 +977,61 @@ with cols[4]:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
+# ── Orbital Elements KPI Row 2 ────────────────────────────
+st.markdown(ST_CARD_STYLE, unsafe_allow_html=True)
+_kpi_els = None
+try:
+    if truth_path.exists():
+        _df_kpi = pd.read_csv(truth_path)
+        if len(_df_kpi) > 0:
+            _row = _df_kpi.iloc[-1]
+            _kpi_els = state_to_elements(
+                [_row['x'] / 1000.0, _row['y'] / 1000.0, _row['z'] / 1000.0],
+                [_row['vx'] / 1000.0, _row['vy'] / 1000.0, _row['vz'] / 1000.0]
+            )
+except Exception:
+    pass
+
+_pc_top = conjunctions[0]['probability_of_collision'] if conjunctions else 0.0
+_eclipse_frac_str = "—"
+try:
+    if truth_path.exists():
+        _df_ecl = pd.read_csv(truth_path)
+        _ecl_mask = compute_eclipse_mask(_df_ecl, epoch_utc)
+        _eclipse_frac_str = f"{100.0 * _ecl_mask.sum() / max(len(_ecl_mask), 1):.1f}%"
+except Exception:
+    pass
+
+_el_a   = f"{_kpi_els['a_km']:.1f}" if _kpi_els else "—"
+_el_e   = f"{_kpi_els['e']:.5f}" if _kpi_els else "—"
+_el_i   = f"{_kpi_els['i_deg']:.2f}°" if _kpi_els else "—"
+_el_T   = f"{_kpi_els['T_min']:.2f}" if _kpi_els else "—"
+_pc_str = f"{_pc_top:.2e}" if _pc_top > 0 else "< 1e-12"
+
+st.markdown(f"""
+<div class="orbit-kpi-row">
+  <div class="orbit-kpi"><div class="lbl">Semi-major Axis</div><div class="val">{_el_a}</div><div class="unit">km</div></div>
+  <div class="orbit-kpi"><div class="lbl">Eccentricity</div><div class="val">{_el_e}</div><div class="unit">—</div></div>
+  <div class="orbit-kpi"><div class="lbl">Inclination</div><div class="val">{_el_i}</div><div class="unit">degrees</div></div>
+  <div class="orbit-kpi"><div class="lbl">Orbit Period</div><div class="val">{_el_T}</div><div class="unit">minutes</div></div>
+  <div class="orbit-kpi"><div class="lbl">Eclipse Fraction</div><div class="val">{_eclipse_frac_str}</div><div class="unit">of arc</div></div>
+  <div class="orbit-kpi"><div class="lbl">Top Pc (Foster)</div><div class="val">{_pc_str}</div><div class="unit">probability</div></div>
+</div>
+""", unsafe_allow_html=True)
+
 # ============================================================
 # Main Dashboard Tabs
 # ============================================================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🌐 3D Space Visualization", 
     "🗺️ Ground Tracks Map", 
     "📈 Error & Residuals", 
     "🎯 B-Plane Risk",
     "📡 Pass Planner",
-    "⚠️ Conjunction Warnings"
+    "⚠️ Conjunction Warnings",
+    "📊 Orbital Analytics"
 ])
+
 
 # ─────────────────────────────────────────────────────────────
 # Tab 1: Live 3D Globe
@@ -866,6 +1244,33 @@ with tab1:
             name="Noisy Observations"
         ))
 
+    # ── 4b. Covariance Uncertainty Ellipsoid ─────────────────
+    if ellipsoid_scale_val > 0 and covariance_path.exists() and ekf_path.exists():
+        try:
+            df_cov = pd.read_csv(covariance_path)
+            df_ekf_ell = pd.read_csv(ekf_path)
+            safe_cov_idx = min(step_idx, len(df_cov) - 1)
+            safe_ekf_idx = min(step_idx, len(df_ekf_ell) - 1)
+            cov_row = df_cov.iloc[safe_cov_idx]
+            ekf_row = df_ekf_ell.iloc[safe_ekf_idx]
+            pos_km = np.array([ekf_row['x'], ekf_row['y'], ekf_row['z']]) / 1000.0
+            ell_mesh = get_covariance_ellipsoid_mesh(
+                pos_km, cov_row, scale_factor=float(ellipsoid_scale_val)
+            )
+            if ell_mesh is not None:
+                ex, ey, ez = ell_mesh
+                fig_3d.add_trace(go.Surface(
+                    x=ex, y=ey, z=ez,
+                    colorscale=[[0, 'rgba(244,63,94,0.22)'], [1, 'rgba(244,63,94,0.28)']],
+                    showscale=False,
+                    opacity=0.30,
+                    name=f"3σ Uncertainty ({ellipsoid_scale})",
+                    hoverinfo='skip',
+                    lighting=dict(ambient=0.9, diffuse=0.4, specular=0.1)
+                ))
+        except Exception:
+            pass
+
     # ── 5. Close Approach Lines ──────────────────────────────
     threshold_m = warning_threshold_km * 1000.0
     for c in conjunctions[:5]:
@@ -933,7 +1338,37 @@ with tab1:
 
     st.plotly_chart(fig_3d, width="stretch")
 
+    # ── Jump Navigation Buttons ────────────────────────────
+    _event_markers = [
+        ("\u23ee\ufe0f Start", 0, "#475569"),
+        ("\u2693 Maneuver", int(man_time / dt) if man_time > 0 else 0, "#d946ef"),
+        ("\u26a0\ufe0f TCA", int(conjunctions[0]['tca_seconds'] / dt) if conjunctions else 0, "#f59e0b"),
+        ("\u23ed\ufe0f End", steps - 1, "#06b6d4"),
+    ]
+    jb_cols = st.columns(len(_event_markers))
+    for _col, (_label, _target_step, _color) in zip(jb_cols, _event_markers):
+        if _col.button(_label, key=f"jump_{_label}"):
+            st.session_state.timeline_step = max(0, min(_target_step, steps - 1))
+            st.rerun()
 
+    # ── Event Timeline Chart ──────────────────────────────
+    try:
+        _df_truth_tl = pd.read_csv(truth_path) if truth_path.exists() else None
+        _df_ekf_tl = pd.read_csv(ekf_path) if ekf_path.exists() else None
+        _ecl_mask_tl = None
+        if _df_truth_tl is not None:
+            _ecl_mask_tl = compute_eclipse_mask(_df_truth_tl, epoch_utc)
+        _passes_tl = []
+        if truth_lla_path.exists():
+            _df_lla_tl = pd.read_csv(truth_lla_path)
+            _passes_tl = detect_gs_passes(_df_lla_tl, gs_lat, gs_lon, gs_alt)
+        if _df_truth_tl is not None:
+            fig_tl = build_event_timeline_chart(
+                _df_truth_tl, _df_ekf_tl, conjunctions, man_time, _passes_tl, _ecl_mask_tl
+            )
+            st.plotly_chart(fig_tl, width="stretch")
+    except Exception as _e:
+        st.warning(f"Timeline chart unavailable: {_e}")
 
 # ------------------------------------------------------------
 # Tab 2: Ground Tracks
@@ -1287,11 +1722,62 @@ with tab6:
     if len(conjunctions) == 0:
         st.info(f"No objects detected within the {warning_threshold_km} km screening threshold.")
     else:
+        # ── Avoidance Burn Advisor ────────────────────────────
+        critical_conj = [c for c in conjunctions if c['probability_of_collision'] > 1e-5 or c['min_distance_m'] < 50_000]
+        if critical_conj:
+            c_top = critical_conj[0]
+            dist_km_top = c_top['min_distance_m'] / 1000.0
+            pc_top = c_top['probability_of_collision']
+            st.markdown(f"""
+<div class="avoidance-card">
+  <h4>🛡️ Collision Avoidance Burn Advisor — Active</h4>
+  <b style="color:#f43f5e">Critical Object:</b> {c_top['sat_name']} &nbsp;|&nbsp;
+  Miss: <b>{dist_km_top:.1f} km</b> &nbsp;|&nbsp;
+  Pc: <b>{pc_top:.2e}</b>
+  <hr style="border-color:#3f065a; margin:8px 0">
+""", unsafe_allow_html=True)
+            try:
+                burn_rec = compute_avoidance_burn_recommendation(
+                    c_top['sat_position_m'], c_top['sat_velocity_m_s'],
+                    c_top['tca_seconds'], dt
+                )
+                if burn_rec and burn_rec['dv_mag'] != 0.0:
+                    comp_icon = {"radial": "⬆️", "in-track": "➡️", "cross-track": "↗️"}.get(burn_rec['component'], "🔧")
+                    sign_str = "+" if burn_rec['dv_mag'] > 0 else ""
+                    st.markdown(f"""
+  <div class="avoidance-rec">{comp_icon} {sign_str}{burn_rec['dv_mag']:.2f} m/s {burn_rec['component'].capitalize()}</div>
+  <div class="avoidance-detail">Projected position separation at TCA: <b style="color:#10b981">{burn_rec['projected_miss_km']:.1f} km</b></div>
+  <div class="avoidance-detail" style="margin-top:4px;font-size:10px;">
+    (Proxy computation using Keplerian forward-prop · for operational use, verify with high-fidelity tool)
+  </div>
+""", unsafe_allow_html=True)
+                    # Apply Burn button
+                    b1, b2, b3 = st.columns([1, 1, 3])
+                    if b1.button("👉 Apply Burn to Planner", key="apply_burn_btn"):
+                        comp = burn_rec['component']
+                        dv = burn_rec['dv_mag']
+                        if comp == "radial":
+                            st.session_state['man_dvr'] = dv
+                        elif comp == "in-track":
+                            st.session_state['st_dvt'] = dv
+                        elif comp == "cross-track":
+                            st.session_state['st_dvn'] = dv
+                        if man_time == 0.0:
+                            st.session_state['man_time_val'] = max(10.0, c_top['tca_seconds'] * 0.5)
+                        st.rerun()
+                    b2.info(f"Burn at T+{c_top['tca_seconds'] * 0.5:.0f}s")
+                else:
+                    st.markdown('<div class="avoidance-detail">No beneficial burn found in ±2 m/s search window.</div>', unsafe_allow_html=True)
+            except Exception as _av_e:
+                st.markdown(f'<div class="avoidance-detail">Advisor unavailable: {_av_e}</div>', unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # ── Conjunction Table ─────────────────────────────────
+        st.markdown("#### 📋 Screened Object Table")
         rows = []
         for idx, c in enumerate(conjunctions):
             dist_km = c['min_distance_m'] / 1000.0
             pc = c['probability_of_collision']
-            
             if pc > 1e-4 or dist_km < 10.0:
                 badge_class = "badge-high"
                 risk_level = "CRITICAL"
@@ -1301,9 +1787,7 @@ with tab6:
             else:
                 badge_class = "badge-low"
                 risk_level = "INFO"
-                
             pc_str = f"{pc:.4e}" if pc > 0 else "0.0"
-            
             rows.append({
                 "Rank": idx + 1,
                 "Debris Name": c['sat_name'],
@@ -1313,9 +1797,168 @@ with tab6:
                 "Risk Level": f'<span class="{badge_class}">{risk_level}</span>',
                 "P_c (Foster)": pc_str
             })
-            
         df_table = pd.DataFrame(rows)
         st.write(df_table.to_html(escape=False, index=False), unsafe_allow_html=True)
+
+
+# ------------------------------------------------------------
+# Tab 7: Orbital Analytics
+# ------------------------------------------------------------
+with tab7:
+    st.markdown("### 📊 Orbital Analytics — Elements, Energy & Filter Convergence")
+    
+    if not truth_path.exists() or not ekf_path.exists():
+        st.info("Run the simulation first to generate orbital analytics data.")
+    else:
+        try:
+            _df_an_truth = pd.read_csv(truth_path)
+            _df_an_ekf   = pd.read_csv(ekf_path)
+            _df_an_cov   = pd.read_csv(covariance_path) if covariance_path.exists() else None
+
+            # Compute Keplerian elements over time
+            _times_an = _df_an_truth['time'].values
+            _a_arr, _e_arr, _i_arr, _T_arr, _alt_arr = [], [], [], [], []
+            _R_E = 6378.137
+            for _row in _df_an_truth.itertuples():
+                _els = state_to_elements(
+                    [_row.x / 1000.0, _row.y / 1000.0, _row.z / 1000.0],
+                    [_row.vx / 1000.0, _row.vy / 1000.0, _row.vz / 1000.0]
+                )
+                if _els:
+                    _a_arr.append(_els['a_km'])
+                    _e_arr.append(_els['e'])
+                    _i_arr.append(_els['i_deg'])
+                    _T_arr.append(_els['T_min'])
+                    _alt_arr.append(_els['a_km'] - _R_E)
+                else:
+                    for _lst in [_a_arr, _e_arr, _i_arr, _T_arr, _alt_arr]:
+                        _lst.append(None)
+
+            # Filter innovation (3D position error over time)
+            _pos_err = np.sqrt(
+                (_df_an_ekf['x'].values - _df_an_truth['x'].values)**2 +
+                (_df_an_ekf['y'].values - _df_an_truth['y'].values)**2 +
+                (_df_an_ekf['z'].values - _df_an_truth['z'].values)**2
+            )
+
+            # Eclipse mask
+            _ecl_mask_an = compute_eclipse_mask(_df_an_truth, epoch_utc)
+
+            # ── Row 1: Elements charts ─────────────────────────────
+            st.markdown("#### 🪐 Keplerian Elements Time History")
+            _c71, _c72 = st.columns(2)
+
+            with _c71:
+                _fig_a = go.Figure()
+                _fig_a.add_trace(go.Scatter(x=_times_an, y=_a_arr, mode='lines',
+                                             line=dict(color='#06b6d4', width=2), name='SMA (km)'))
+                _fig_a.update_layout(height=220, margin=dict(l=0,r=0,b=0,t=28),
+                                      paper_bgcolor='rgba(2,5,15,1)', plot_bgcolor='rgba(5,10,25,0.8)',
+                                      title=dict(text='Semi-major Axis a (km)', font=dict(color='#cbd5e1', size=12)),
+                                      xaxis=dict(color='#64748b', gridcolor='#1e293b'),
+                                      yaxis=dict(color='#64748b', gridcolor='#1e293b'),
+                                      font=dict(color='#f3f4f6'), showlegend=False)
+                st.plotly_chart(_fig_a, width="stretch")
+
+                _fig_e = go.Figure()
+                _fig_e.add_trace(go.Scatter(x=_times_an, y=_e_arr, mode='lines',
+                                             line=dict(color='#a855f7', width=2), name='Eccentricity'))
+                _fig_e.update_layout(height=220, margin=dict(l=0,r=0,b=0,t=28),
+                                      paper_bgcolor='rgba(2,5,15,1)', plot_bgcolor='rgba(5,10,25,0.8)',
+                                      title=dict(text='Eccentricity e', font=dict(color='#cbd5e1', size=12)),
+                                      xaxis=dict(color='#64748b', gridcolor='#1e293b'),
+                                      yaxis=dict(color='#64748b', gridcolor='#1e293b', tickformat='.5f'),
+                                      font=dict(color='#f3f4f6'), showlegend=False)
+                st.plotly_chart(_fig_e, width="stretch")
+
+            with _c72:
+                _fig_i = go.Figure()
+                _fig_i.add_trace(go.Scatter(x=_times_an, y=_i_arr, mode='lines',
+                                             line=dict(color='#f59e0b', width=2), name='Inclination (deg)'))
+                _fig_i.update_layout(height=220, margin=dict(l=0,r=0,b=0,t=28),
+                                      paper_bgcolor='rgba(2,5,15,1)', plot_bgcolor='rgba(5,10,25,0.8)',
+                                      title=dict(text='Inclination i (°)', font=dict(color='#cbd5e1', size=12)),
+                                      xaxis=dict(color='#64748b', gridcolor='#1e293b'),
+                                      yaxis=dict(color='#64748b', gridcolor='#1e293b'),
+                                      font=dict(color='#f3f4f6'), showlegend=False)
+                st.plotly_chart(_fig_i, width="stretch")
+
+                _fig_T = go.Figure()
+                _fig_T.add_trace(go.Scatter(x=_times_an, y=_T_arr, mode='lines',
+                                             line=dict(color='#10b981', width=2), name='Period (min)'))
+                _fig_T.update_layout(height=220, margin=dict(l=0,r=0,b=0,t=28),
+                                      paper_bgcolor='rgba(2,5,15,1)', plot_bgcolor='rgba(5,10,25,0.8)',
+                                      title=dict(text='Orbital Period T (min)', font=dict(color='#cbd5e1', size=12)),
+                                      xaxis=dict(color='#64748b', gridcolor='#1e293b'),
+                                      yaxis=dict(color='#64748b', gridcolor='#1e293b'),
+                                      font=dict(color='#f3f4f6'), showlegend=False)
+                st.plotly_chart(_fig_T, width="stretch")
+
+            # ── Row 2: Filter innovation + Eclipse ────────────────
+            st.markdown("#### 🔬 Filter Convergence & Eclipse Profile")
+            _c73, _c74 = st.columns(2)
+
+            with _c73:
+                _fig_err = go.Figure()
+                _fig_err.add_trace(go.Scatter(
+                    x=_times_an, y=_pos_err,
+                    mode='lines', line=dict(color='#f43f5e', width=2), fill='tozeroy',
+                    fillcolor='rgba(244,63,94,0.08)', name='Position Error (m)'
+                ))
+                _fig_err.update_layout(height=220, margin=dict(l=0,r=0,b=0,t=28),
+                                        paper_bgcolor='rgba(2,5,15,1)', plot_bgcolor='rgba(5,10,25,0.8)',
+                                        title=dict(text=f'Filter Innovation — {filter_choice} 3D Position Error (m)',
+                                                   font=dict(color='#cbd5e1', size=12)),
+                                        xaxis=dict(title='Time (s)', color='#64748b', gridcolor='#1e293b'),
+                                        yaxis=dict(color='#64748b', gridcolor='#1e293b'),
+                                        font=dict(color='#f3f4f6'), showlegend=False)
+                st.plotly_chart(_fig_err, width="stretch")
+
+            with _c74:
+                _ecl_vals = _ecl_mask_an.astype(float)
+                _fig_ecl = go.Figure()
+                _fig_ecl.add_trace(go.Scatter(
+                    x=_times_an, y=_ecl_vals,
+                    mode='lines', line=dict(color='#64748b', width=1.5),
+                    fill='tozeroy', fillcolor='rgba(30,41,59,0.5)', name='Eclipse'
+                ))
+                _fig_ecl.update_layout(height=220, margin=dict(l=0,r=0,b=0,t=28),
+                                        paper_bgcolor='rgba(2,5,15,1)', plot_bgcolor='rgba(5,10,25,0.8)',
+                                        title=dict(text=f'Eclipse Profile (1=shadow, frac={_eclipse_frac_str})',
+                                                   font=dict(color='#cbd5e1', size=12)),
+                                        xaxis=dict(title='Time (s)', color='#64748b', gridcolor='#1e293b'),
+                                        yaxis=dict(color='#64748b', gridcolor='#1e293b', range=[-0.1, 1.1]),
+                                        font=dict(color='#f3f4f6'), showlegend=False)
+                st.plotly_chart(_fig_ecl, width="stretch")
+
+            # ── Covariance trace ──────────────────────────────────
+            if _df_an_cov is not None:
+                st.markdown("#### 📐 Covariance Diagonal (Position σ) Over Time")
+                _fig_cov = go.Figure()
+                _fig_cov.add_trace(go.Scatter(x=_df_an_cov['time'],
+                                               y=np.sqrt(_df_an_cov['p_xx']),
+                                               mode='lines', line=dict(color='#06b6d4', width=1.5), name='σ_x (m)'))
+                _fig_cov.add_trace(go.Scatter(x=_df_an_cov['time'],
+                                               y=np.sqrt(_df_an_cov['p_yy']),
+                                               mode='lines', line=dict(color='#a855f7', width=1.5), name='σ_y (m)'))
+                _fig_cov.add_trace(go.Scatter(x=_df_an_cov['time'],
+                                               y=np.sqrt(_df_an_cov['p_zz']),
+                                               mode='lines', line=dict(color='#f59e0b', width=1.5), name='σ_z (m)'))
+                _fig_cov.update_layout(height=220, margin=dict(l=0,r=0,b=0,t=28),
+                                        paper_bgcolor='rgba(2,5,15,1)', plot_bgcolor='rgba(5,10,25,0.8)',
+                                        title=dict(text='Position Covariance σ (1σ, metres)',
+                                                   font=dict(color='#cbd5e1', size=12)),
+                                        xaxis=dict(title='Time (s)', color='#64748b', gridcolor='#1e293b'),
+                                        yaxis=dict(color='#64748b', gridcolor='#1e293b'),
+                                        legend=dict(bgcolor='rgba(3,7,18,0.75)', font=dict(color='#cbd5e1', size=10)),
+                                        font=dict(color='#f3f4f6'))
+                st.plotly_chart(_fig_cov, width="stretch")
+
+        except Exception as _tab7_err:
+            st.error(f"Orbital analytics error: {_tab7_err}")
+            import traceback
+            st.code(traceback.format_exc())
+
 
 # ─────────────────────────────────────────────────────────────
 # Auto-play loop – trigger rerun after brief sleep

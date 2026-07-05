@@ -1,6 +1,7 @@
 use crate::state::OrbitalState;
 use crate::rk4::rk4_step;
 use crate::dynamics::state_derivative;
+use crate::rk45::propagate_rk45;
 use nalgebra::{Matrix6, Vector3, Vector6};
 
 /// Propagate the orbital state starting from t=0.0.
@@ -96,4 +97,11 @@ pub fn propagate_with_covariance_from(
     }
     
     (traj_main, covariances)
+}
+
+/// Propagate using adaptive RK45 (outputs same uniform-step trajectory format).
+pub fn propagate_adaptive(state0: &OrbitalState, dt: f64, steps: usize, t_start: f64) -> Vec<OrbitalState> {
+    let f = |r: &Vector3<f64>, v: &Vector3<f64>, t: f64| state_derivative(r, v, t);
+    let result = propagate_rk45(&f, &state0.r, &state0.v, t_start, dt, steps, 1.0, 1e-9);
+    result.into_iter().map(|(r, v)| OrbitalState::new(r, v)).collect()
 }

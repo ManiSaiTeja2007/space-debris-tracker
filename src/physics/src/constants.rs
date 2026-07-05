@@ -16,12 +16,10 @@ pub const J4_EARTH: f64 = -1.61098761e-6;
 // Earth rotation rate (rad/s)
 pub const OMEGA_EARTH: f64 = 7.2921151467e-5;
 
-// High-fidelity Atmospheric Drag Parameters
+// Atmospheric Drag Parameters
 pub const CD: f64 = 2.2;              // Drag coefficient
 pub const A_OVER_M: f64 = 0.01;        // Area-to-mass ratio (m^2/kg)
-pub const RHO_0: f64 = 3.72e-12;       // Reference density at 400 km (kg/m^3)
-pub const H_0: f64 = 400.0e3;          // Reference altitude (m)
-pub const H_SCALE: f64 = 58.2e3;       // Scale height (m)
+// Note: atmosphere density constants moved into drag.rs (5-layer ATMO_TABLE)
 
 // Sun & Moon gravitational parameters (m^3/s^2)
 pub const MU_SUN: f64 = 1.32712440018e20;
