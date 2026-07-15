@@ -39,5 +39,5 @@ pub fn accel_srp(r: &Vector3<f64>, t: f64) -> Vector3<f64> {
     // 2. Compute SRP acceleration
     // a_srp = - P_srp * (A/m) * C_R * nu * u_sun_target
     let accel_mag = P_SRP * A_OVER_M * CR * nu;
-    -accel_mag * u_sun_target
+    accel_mag * u_sun_target
 }
